@@ -1,8 +1,8 @@
 local Utils = require("avante.utils")
 local Config = require("avante.config")
 local Llm = require("avante.llm")
-local Highlights = require("avante.highlights")
 local Provider = require("avante.providers")
+local RepoMap = require("avante.repo_map")
 
 local api = vim.api
 local fn = vim.fn
@@ -274,6 +274,11 @@ function Selection:create_editing_input()
 
   self.selection = Utils.get_visual_selection_and_range()
 
+  if self.selection == nil then
+    Utils.error("No visual selection found", { once = true, title = "Avante" })
+    return
+  end
+
   local start_row
   local start_col
   local end_row
@@ -362,7 +367,13 @@ function Selection:create_editing_input()
     ---@type AvanteChunkParser
     local on_chunk = function(chunk)
       full_response = full_response .. chunk
-      local response_lines = vim.split(full_response, "\n")
+      local response_lines_ = vim.split(full_response, "\n")
+      local response_lines = {}
+      for i, line in ipairs(response_lines_) do
+        if not (string.match(line, "^```") and (i == 1 or i == #response_lines_)) then
+          table.insert(response_lines, line)
+        end
+      end
       if #response_lines == 1 then
         local first_line = response_lines[1]
         local first_line_indentation = Utils.get_indentation(first_line)
@@ -391,10 +402,16 @@ function Selection:create_editing_input()
     end
 
     local filetype = api.nvim_get_option_value("filetype", { buf = code_bufnr })
+    local file_ext = api.nvim_buf_get_name(code_bufnr):match("^.+%.(.+)$")
+
+    local mentions = Utils.extract_mentions(input)
+    input = mentions.new_content
+    local project_context = mentions.enable_project_context and RepoMap.get_repo_map(file_ext) or nil
 
     Llm.stream({
       bufnr = code_bufnr,
       ask = true,
+      project_context = vim.json.encode(project_context),
       file_content = code_content,
       code_lang = filetype,
       selected_code = self.selection.content,
@@ -449,6 +466,25 @@ function Selection:create_editing_input()
       if close_unfocus then
         api.nvim_del_autocmd(close_unfocus)
         close_unfocus = nil
+      end
+    end,
+  })
+
+  api.nvim_create_autocmd("InsertEnter", {
+    group = self.augroup,
+    buffer = bufnr,
+    once = true,
+    desc = "Setup the completion of helpers in the input buffer",
+    callback = function()
+      local has_cmp, cmp = pcall(require, "cmp")
+      if has_cmp then
+        cmp.register_source("avante_mentions", require("cmp_avante.mentions").new(Utils.get_mentions(), bufnr))
+        cmp.setup.buffer({
+          enabled = true,
+          sources = {
+            { name = "avante_mentions" },
+          },
+        })
       end
     end,
   })

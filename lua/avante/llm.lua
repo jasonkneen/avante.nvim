@@ -1,4 +1,5 @@
 local api = vim.api
+local fn = vim.fn
 
 local curl = require("plenary.curl")
 
@@ -60,11 +61,14 @@ M.stream = function(opts)
 
   Path.prompts.initialize(Path.prompts.get(opts.bufnr))
 
+  local filepath = Utils.relative_path(api.nvim_buf_get_name(opts.bufnr))
+
   local template_opts = {
     use_xml_format = Provider.use_xml_format,
     ask = opts.ask, -- TODO: add mode without ask instruction
     question = original_instructions,
     code_lang = opts.code_lang,
+    filepath = filepath,
     file_content = opts.file_content,
     selected_code = opts.selected_code,
     project_context = opts.project_context,
@@ -73,15 +77,15 @@ M.stream = function(opts)
 
   local user_prompts = vim
     .iter({
-      Path.prompts.render_file("_context.avanterules", template_opts),
       Path.prompts.render_file("_project.avanterules", template_opts),
       Path.prompts.render_file("_memory.avanterules", template_opts),
+      Path.prompts.render_file("_context.avanterules", template_opts),
       Path.prompts.render_mode(mode, template_opts),
     })
     :filter(function(k) return k ~= "" end)
     :totable()
 
-  Utils.debug(user_prompts)
+  Utils.debug("user prompts:", user_prompts)
 
   ---@type AvantePromptOptions
   local code_opts = {
@@ -98,8 +102,6 @@ M.stream = function(opts)
   ---@type AvanteCurlOutput
   local spec = Provider.parse_curl_args(Provider, code_opts)
 
-  Utils.debug(spec)
-
   ---@param line string
   local function parse_stream_data(line)
     local event = line:match("^event: (.+)$")
@@ -111,15 +113,30 @@ M.stream = function(opts)
     if data_match then Provider.parse_response(data_match, current_event_state, handler_opts) end
   end
 
+  local function parse_response_without_stream(data)
+    Provider.parse_response_without_stream(data, current_event_state, handler_opts)
+  end
+
   local completed = false
 
   local active_job
+
+  local curl_body_file = fn.tempname() .. ".json"
+  local json_content = vim.json.encode(spec.body)
+  fn.writefile(vim.split(json_content, "\n"), curl_body_file)
+
+  Utils.debug("curl body file:", curl_body_file)
+
+  local function cleanup()
+    if Config.debug then return end
+    vim.schedule(function() fn.delete(curl_body_file) end)
+  end
 
   active_job = curl.post(spec.url, {
     headers = spec.headers,
     proxy = spec.proxy,
     insecure = spec.insecure,
-    body = vim.json.encode(spec.body),
+    body = curl_body_file,
     stream = function(err, data, _)
       if err then
         completed = true
@@ -148,10 +165,12 @@ M.stream = function(opts)
     on_error = function()
       active_job = nil
       completed = true
+      cleanup()
       opts.on_complete(nil)
     end,
     callback = function(result)
       active_job = nil
+      cleanup()
       if result.status >= 400 then
         if Provider.on_error then
           Provider.on_error(result)
@@ -167,6 +186,14 @@ M.stream = function(opts)
           end
         end)
       end
+
+      -- If stream is not enabled, then handle the response here
+      if spec.body.stream == false and result.status == 200 then
+        vim.schedule(function()
+          completed = true
+          parse_response_without_stream(result.body)
+        end)
+      end
     end,
   })
 
@@ -178,7 +205,7 @@ M.stream = function(opts)
       -- Error: cannot resume dead coroutine
       if active_job then
         xpcall(function() active_job:shutdown() end, function(err) return err end)
-        Utils.debug("LLM request cancelled", { title = "Avante" })
+        Utils.debug("LLM request cancelled")
         active_job = nil
       end
     end,

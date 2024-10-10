@@ -11,6 +11,7 @@ local Diff = require("avante.diff")
 local Llm = require("avante.llm")
 local Utils = require("avante.utils")
 local Highlights = require("avante.highlights")
+local RepoMap = require("avante.repo_map")
 
 local RESULT_BUF_NAME = "AVANTE_RESULT"
 local VIEW_BUFFER_UPDATED_PATTERN = "AvanteViewBufferUpdated"
@@ -27,7 +28,6 @@ local Sidebar = {}
 
 ---@class avante.Sidebar
 ---@field id integer
----@field registered_cmp boolean
 ---@field augroup integer
 ---@field code avante.CodeState
 ---@field winids table<string, integer> this table stores the winids of the sidebar components (result, selected_code, input), even though they are destroyed.
@@ -39,7 +39,6 @@ local Sidebar = {}
 function Sidebar:new(id)
   return setmetatable({
     id = id,
-    registered_cmp = false,
     code = { bufnr = 0, winid = 0, selection = nil },
     winids = {
       result = 0,
@@ -134,51 +133,6 @@ function Sidebar:toggle(opts)
   end
 end
 
-local function realign_line_numbers(code_lines, snippet)
-  local snippet_lines = vim.split(snippet.content, "\n")
-  local snippet_lines_count = #snippet_lines
-
-  local start_line = snippet.range[1]
-
-  local correct_start
-  for i = start_line, math.max(1, start_line - snippet_lines_count + 1), -1 do
-    local matched = true
-    for j = 1, math.min(snippet_lines_count, start_line - i + 1) do
-      if code_lines[i + j - 1] ~= snippet_lines[j] then
-        matched = false
-        break
-      end
-    end
-    if matched then
-      correct_start = i
-      break
-    end
-  end
-
-  local end_line = snippet.range[2]
-
-  local correct_end
-  for i = snippet_lines_count - 1, 1, -1 do
-    local matched = true
-    for j = 1, i do
-      if code_lines[end_line + j - 1] ~= snippet_lines[snippet_lines_count - j] then
-        matched = false
-        break
-      end
-    end
-    if matched then
-      correct_end = end_line + i
-      break
-    end
-  end
-
-  if correct_start then snippet.range[1] = correct_start end
-
-  if correct_end then snippet.range[2] = correct_end end
-
-  return snippet
-end
-
 ---@class AvanteReplacementResult
 ---@field content string
 ---@field is_searching boolean
@@ -191,7 +145,8 @@ end
 ---@param code_lang string
 ---@return AvanteReplacementResult
 local function transform_result_content(original_content, result_content, code_lang)
-  local transformed = ""
+  local transformed_lines = {}
+
   local original_lines = vim.split(original_content, "\n")
   local result_lines = vim.split(result_content, "\n")
 
@@ -200,50 +155,21 @@ local function transform_result_content(original_content, result_content, code_l
   local last_search_tag_start_line = 0
   local last_replace_tag_start_line = 0
 
-  local trim_breakline_suffix = false
+  local search_start = 0
 
   local i = 1
   while i <= #result_lines do
-    if result_lines[i] == "<SEARCH>" then
+    local line_content = result_lines[i]
+    if line_content == "<SEARCH>" then
       is_searching = true
+      search_start = i + 1
       last_search_tag_start_line = i
-      local search_start = i + 1
-      local search_end = search_start
-      while search_end <= #result_lines and result_lines[search_end] ~= "</SEARCH>" do
-        search_end = search_end + 1
-      end
+    elseif line_content == "</SEARCH>" then
+      is_searching = false
+      local search_end = i
 
-      if search_end > #result_lines then
-        trim_breakline_suffix = false
-        -- <SEARCH> tag is not closed, add remaining content and return
-        transformed = transformed .. table.concat(result_lines, "\n", i)
-        break
-      end
-
-      local replace_start = search_end + 2 -- Skip </SEARCH> and <REPLACE>
-      if replace_start > #result_lines or result_lines[replace_start - 1] ~= "<REPLACE>" then
-        trim_breakline_suffix = false
-        -- <REPLACE> tag is missing, add remaining content and return
-        transformed = transformed .. table.concat(result_lines, "\n", i)
-        break
-      end
-
-      is_replacing = true
-      last_replace_tag_start_line = replace_start - 1
-      local replace_end = replace_start
-      while replace_end <= #result_lines and result_lines[replace_end] ~= "</REPLACE>" do
-        replace_end = replace_end + 1
-      end
-
-      if replace_end > #result_lines then
-        trim_breakline_suffix = false
-        -- </REPLACE> tag is missing, add remaining content and return
-        transformed = transformed .. table.concat(result_lines, "\n", i)
-        break
-      end
-
-      -- Find the corresponding lines in the original content
-      local start_line, end_line
+      local start_line = 0
+      local end_line = 0
       for j = 1, #original_lines - (search_end - search_start) + 1 do
         local match = true
         for k = 0, search_end - search_start - 1 do
@@ -261,26 +187,37 @@ local function transform_result_content(original_content, result_content, code_l
         end
       end
 
-      if start_line and end_line then
-        transformed = transformed .. string.format("Replace lines: %d-%d\n```%s\n", start_line, end_line, code_lang)
-        for j = replace_start, replace_end - 1 do
-          transformed = transformed .. result_lines[j] .. "\n"
+      local search_start_tag_idx_in_transformed_lines = 0
+      for j = 1, #transformed_lines do
+        if transformed_lines[j] == "<SEARCH>" then
+          search_start_tag_idx_in_transformed_lines = j
+          break
         end
-        transformed = transformed .. "```\n"
       end
-
-      i = replace_end + 1 -- Move to the line after </REPLACE>
-      is_searching = false
+      if search_start_tag_idx_in_transformed_lines > 0 then
+        transformed_lines = vim.list_slice(transformed_lines, 1, search_start_tag_idx_in_transformed_lines - 1)
+      end
+      vim.list_extend(transformed_lines, {
+        string.format("Replace lines: %d-%d", start_line, end_line),
+        string.format("```%s", code_lang),
+      })
+      goto continue
+    elseif line_content == "<REPLACE>" then
+      is_replacing = true
+      last_replace_tag_start_line = i
+      goto continue
+    elseif line_content == "</REPLACE>" then
       is_replacing = false
-    else
-      trim_breakline_suffix = true
-      transformed = transformed .. result_lines[i] .. "\n"
-      i = i + 1
+      table.insert(transformed_lines, "```")
+      goto continue
     end
+    table.insert(transformed_lines, line_content)
+    ::continue::
+    i = i + 1
   end
 
   return {
-    content = trim_breakline_suffix and transformed:sub(1, -2) or transformed, -- Remove trailing newline
+    content = table.concat(transformed_lines, "\n"),
     is_searching = is_searching,
     is_replacing = is_replacing,
     last_search_tag_start_line = last_search_tag_start_line,
@@ -288,25 +225,69 @@ local function transform_result_content(original_content, result_content, code_l
   }
 end
 
-local searching_hints = { "\n 🔍   Searching...", "\n  🔍  Searching...", "\n   🔍 Searching..." }
-local searching_hint_idx = 1
+local spinner_chars = {
+  "⡀",
+  "⠄",
+  "⠂",
+  "⠁",
+  "⠈",
+  "⠐",
+  "⠠",
+  "⢀",
+  "⣀",
+  "⢄",
+  "⢂",
+  "⢁",
+  "⢈",
+  "⢐",
+  "⢠",
+  "⣠",
+  "⢤",
+  "⢢",
+  "⢡",
+  "⢨",
+  "⢰",
+  "⣰",
+  "⢴",
+  "⢲",
+  "⢱",
+  "⢸",
+  "⣸",
+  "⢼",
+  "⢺",
+  "⢹",
+  "⣹",
+  "⢽",
+  "⢻",
+  "⣻",
+  "⢿",
+  "⣿",
+  "⣶",
+  "⣤",
+  "⣀",
+}
+local spinner_index = 1
+
+local function get_searching_hint()
+  spinner_index = (spinner_index % #spinner_chars) + 1
+  local spinner = spinner_chars[spinner_index]
+  return "\n" .. spinner .. " Searching..."
+end
+
+local function get_display_content_suffix(replacement)
+  if replacement.is_searching then return get_searching_hint() end
+  return ""
+end
 
 ---@param replacement AvanteReplacementResult
 ---@return string
 local function generate_display_content(replacement)
-  local searching_hint = searching_hints[searching_hint_idx]
-  if searching_hint_idx >= #searching_hints then
-    searching_hint_idx = 1
-  else
-    searching_hint_idx = searching_hint_idx + 1
-  end
   if replacement.is_searching then
     return table.concat(
       vim.list_slice(vim.split(replacement.content, "\n"), 1, replacement.last_search_tag_start_line - 1),
       "\n"
-    ) .. searching_hint
+    )
   end
-  if replacement.is_replacing then return replacement.content .. "\n```" end
   return replacement.content
 end
 
@@ -318,11 +299,9 @@ end
 ---@field start_line_in_response_buf integer
 ---@field end_line_in_response_buf integer
 
----@param code_content string
 ---@param response_content string
 ---@return AvanteCodeSnippet[]
-local function extract_code_snippets(code_content, response_content)
-  local code_lines = vim.split(code_content, "\n")
+local function extract_code_snippets(response_content)
   local snippets = {}
   local current_snippet = {}
   local in_code_block = false
@@ -359,7 +338,6 @@ local function extract_code_snippets(code_content, response_content)
             start_line_in_response_buf = start_line_in_response_buf,
             end_line_in_response_buf = idx,
           }
-          snippet = realign_line_numbers(code_lines, snippet)
           table.insert(snippets, snippet)
         end
         current_snippet = {}
@@ -441,17 +419,14 @@ local function insert_conflict_contents(bufnr, snippets)
 
     local result = {}
     table.insert(result, "<<<<<<< HEAD")
-    if start_line ~= end_line then
-      for i = start_line, end_line do
-        table.insert(result, lines[i])
-      end
+    for i = start_line, end_line do
+      table.insert(result, lines[i])
     end
     table.insert(result, "=======")
 
     local snippet_lines = vim.split(snippet.content, "\n")
 
     for idx, line in ipairs(snippet_lines) do
-      line = Utils.trim_line_number(line)
       if idx == 1 then
         local indentation = Utils.get_indentation(line)
         need_prepend_indentation = indentation ~= original_start_line_indentation
@@ -459,8 +434,6 @@ local function insert_conflict_contents(bufnr, snippets)
       if need_prepend_indentation then line = original_start_line_indentation .. line end
       table.insert(result, line)
     end
-
-    if start_line == end_line then table.insert(result, lines[start_line]) end
 
     table.insert(result, ">>>>>>> Snippet")
 
@@ -517,7 +490,7 @@ end
 function Sidebar:apply(current_cursor)
   local content = table.concat(Utils.get_buf_lines(0, -1, self.code.bufnr), "\n")
   local response, response_start_line = self:get_content_between_separators()
-  local all_snippets = extract_code_snippets(content, response)
+  local all_snippets = extract_code_snippets(response)
   all_snippets = ensure_snippets_no_overlap(content, all_snippets)
   local selected_snippets = {}
   if current_cursor then
@@ -703,9 +676,9 @@ function Sidebar:on_mount(opts)
 
     current_apply_extmark_id =
       api.nvim_buf_set_extmark(self.result.bufnr, CODEBLOCK_KEYBINDING_NAMESPACE, block.start_line, -1, {
-        virt_text = { { " [<a>: apply this, <A>: apply all] ", "Keyword" } },
+        virt_text = { { " [<a>: apply this, <A>: apply all] ", "AvanteInlineHint" } },
         virt_text_pos = "right_align",
-        hl_group = "Keyword",
+        hl_group = "AvanteInlineHint",
         priority = PRIORITY,
       })
   end
@@ -955,8 +928,36 @@ function Sidebar:is_focused_on(winid)
   return false
 end
 
+local function delete_last_n_chars(bufnr, n)
+  bufnr = bufnr or api.nvim_get_current_buf()
+
+  local line_count = api.nvim_buf_line_count(bufnr)
+
+  while n > 0 and line_count > 0 do
+    local last_line = api.nvim_buf_get_lines(bufnr, line_count - 1, line_count, false)[1]
+
+    local total_chars_in_line = #last_line + 1
+
+    if total_chars_in_line > n then
+      local chars_to_keep = total_chars_in_line - n - 1 - 1
+      local new_last_line = last_line:sub(1, chars_to_keep)
+      if new_last_line == "" then
+        api.nvim_buf_set_lines(bufnr, line_count - 1, line_count, false, {})
+        line_count = line_count - 1
+      else
+        api.nvim_buf_set_lines(bufnr, line_count - 1, line_count, false, { new_last_line })
+      end
+      n = 0
+    else
+      n = n - total_chars_in_line
+      api.nvim_buf_set_lines(bufnr, line_count - 1, line_count, false, {})
+      line_count = line_count - 1
+    end
+  end
+end
+
 ---@param content string concatenated content of the buffer
----@param opts? {focus?: boolean, stream?: boolean, scroll?: boolean, callback?: fun(): nil} whether to focus the result view
+---@param opts? {focus?: boolean, stream?: boolean, scroll?: boolean, backspace?: integer, callback?: fun(): nil} whether to focus the result view
 function Sidebar:update_content(content, opts)
   if not self.result or not self.result.bufnr then return end
   opts = vim.tbl_deep_extend("force", { focus = true, scroll = true, stream = false, callback = nil }, opts or {})
@@ -978,9 +979,10 @@ function Sidebar:update_content(content, opts)
 
     vim.schedule(function()
       if not self.result or not self.result.bufnr or not api.nvim_buf_is_valid(self.result.bufnr) then return end
+      Utils.unlock_buf(self.result.bufnr)
+      if opts.backspace ~= nil and opts.backspace > 0 then delete_last_n_chars(self.result.bufnr, opts.backspace) end
       scroll_to_bottom()
       local lines = vim.split(content, "\n")
-      Utils.unlock_buf(self.result.bufnr)
       api.nvim_buf_call(self.result.bufnr, function() api.nvim_put(lines, "c", true, true) end)
       Utils.lock_buf(self.result.bufnr)
       api.nvim_set_option_value("filetype", "Avante", { buf = self.result.bufnr })
@@ -1177,6 +1179,8 @@ function Sidebar:create_selected_code()
   end
 end
 
+local generating_text = "**Generating response ...**\n"
+
 local hint_window = nil
 
 ---@param opts AskOptions
@@ -1199,18 +1203,14 @@ function Sidebar:create_input(opts)
     --- prevent the cursor from jumping to the bottom of the
     --- buffer at the beginning
     self:update_content("", { focus = true, scroll = false })
-    self:update_content(content_prefix .. "**Generating response ...**\n")
+    self:update_content(content_prefix .. generating_text)
 
     local content = table.concat(Utils.get_buf_lines(0, -1, self.code.bufnr), "\n")
-    local content_with_line_numbers = Utils.prepend_line_number(content)
 
     local filetype = api.nvim_get_option_value("filetype", { buf = self.code.bufnr })
 
-    local selected_code_content_with_line_numbers = nil
-    if self.code.selection ~= nil then
-      selected_code_content_with_line_numbers =
-        Utils.prepend_line_number(self.code.selection.content, self.code.selection.range.start.line)
-    end
+    local selected_code_content = nil
+    if self.code.selection ~= nil then selected_code_content = self.code.selection.content end
 
     if request:sub(1, 1) == "/" then
       local command, args = request:match("^/(%S+)%s*(.*)")
@@ -1233,10 +1233,8 @@ function Sidebar:create_input(opts)
               Utils.error("Invalid end line number", { once = true, title = "Avante" })
               return
             end
-            selected_code_content_with_line_numbers = Utils.prepend_line_number(
-              table.concat(api.nvim_buf_get_lines(self.code.bufnr, start_line - 1, end_line, false), "\n"),
-              start_line
-            )
+            selected_code_content =
+              table.concat(api.nvim_buf_get_lines(self.code.bufnr, start_line - 1, end_line, false), "\n")
             request = question
           end)
         else
@@ -1249,20 +1247,27 @@ function Sidebar:create_input(opts)
       end
     end
 
-    local full_response = ""
+    local original_response = ""
+    local transformed_response = ""
+    local displayed_response = ""
 
     local is_first_chunk = true
 
     ---@type AvanteChunkParser
     local on_chunk = function(chunk)
-      full_response = full_response .. chunk
+      original_response = original_response .. chunk
+      local transformed = transform_result_content(content, transformed_response .. chunk, filetype)
+      transformed_response = transformed.content
+      local cur_displayed_response = generate_display_content(transformed)
       if is_first_chunk then
         is_first_chunk = false
         self:update_content(content_prefix .. chunk, { stream = false, scroll = true })
         return
       end
-      self:update_content(chunk, { stream = true, scroll = true })
+      local suffix = get_display_content_suffix(transformed)
+      self:update_content(content_prefix .. cur_displayed_response .. suffix, { stream = false, scroll = true })
       vim.schedule(function() vim.cmd("redraw") end)
+      displayed_response = cur_displayed_response
     end
 
     ---@type AvanteCompleteParser
@@ -1291,17 +1296,26 @@ function Sidebar:create_input(opts)
         provider = Config.provider,
         model = model,
         request = request,
-        response = full_response,
+        response = displayed_response,
+        original_response = original_response,
       })
       Path.history.save(self.code.bufnr, chat_history)
     end
 
+    local mentions = Utils.extract_mentions(request)
+    request = mentions.new_content
+
+    local file_ext = api.nvim_buf_get_name(self.code.bufnr):match("^.+%.(.+)$")
+
+    local project_context = mentions.enable_project_context and RepoMap.get_repo_map(file_ext) or nil
+
     Llm.stream({
       bufnr = self.code.bufnr,
       ask = opts.ask,
-      file_content = content_with_line_numbers,
+      project_context = vim.json.encode(project_context),
+      file_content = content,
       code_lang = filetype,
-      selected_code = selected_code_content_with_line_numbers,
+      selected_code = selected_code_content,
       instructions = request,
       mode = "planning",
       on_chunk = on_chunk,
@@ -1358,9 +1372,9 @@ function Sidebar:create_input(opts)
   local function place_sign_at_first_line(bufnr)
     local group = "avante_input_prompt_group"
 
-    vim.fn.sign_unplace(group, { buffer = bufnr })
+    fn.sign_unplace(group, { buffer = bufnr })
 
-    vim.fn.sign_place(0, group, "AvanteInputPromptSign", bufnr, { lnum = 1 })
+    fn.sign_place(0, group, "AvanteInputPromptSign", bufnr, { lnum = 1 })
   end
 
   place_sign_at_first_line(self.input.bufnr)
@@ -1384,16 +1398,36 @@ function Sidebar:create_input(opts)
     callback = function()
       local has_cmp, cmp = pcall(require, "cmp")
       if has_cmp then
-        if not self.registered_cmp then
-          self.registered_cmp = true
-          cmp.register_source("avante_commands", require("cmp_avante.commands").new(self))
-        end
+        cmp.register_source("avante_commands", require("cmp_avante.commands").new(self))
+        cmp.register_source(
+          "avante_mentions",
+          require("cmp_avante.mentions").new(Utils.get_mentions(), self.input.bufnr)
+        )
         cmp.setup.buffer({
           enabled = true,
           sources = {
             { name = "avante_commands" },
+            { name = "avante_mentions" },
           },
         })
+      end
+    end,
+  })
+
+  -- Unregister completion
+  api.nvim_create_autocmd("BufLeave", {
+    group = self.augroup,
+    buffer = self.input.bufnr,
+    once = false,
+    desc = "Unregister the completion of helpers in the input buffer",
+    callback = function()
+      local has_cmp, cmp = pcall(require, "cmp")
+      if has_cmp then
+        for _, source in ipairs(cmp.core:get_sources()) do
+          if source.name == "avante_commands" or source.name == "avante_mentions" then
+            cmp.unregister_source(source.id)
+          end
+        end
       end
     end,
   })
